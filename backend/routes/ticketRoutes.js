@@ -3,7 +3,7 @@ const router = express.Router();
 const mongoose = require('mongoose');
 const Ticket = require('../models/Ticket');
 const Event = require('../models/Event');
-const { authGuard, requireRole } = require('../middleware/authGuard');
+const { authGuard } = require('../middleware/authGuard');
 
 // All ticket routes require authentication
 router.use(authGuard);
@@ -11,7 +11,7 @@ router.use(authGuard);
 /**
  * GET /api/v1/tickets/my
  * Returns tickets belonging to the authenticated attendee.
- * Populates attendee and event details.
+ * Populates attendeeId and eventId fields.
  */
 router.get('/my', async (req, res, next) => {
   try {
@@ -29,19 +29,15 @@ router.get('/my', async (req, res, next) => {
 /**
  * POST /api/v1/tickets
  * Creates a ticket booking for the authenticated attendee.
- * Atomically decrements event inventory.
+ * Uses atomic findOneAndUpdate with $gte guard — safe on standalone MongoDB.
  * Returns 201 on success, 400 if insufficient tickets.
  */
 router.post('/', async (req, res, next) => {
-  // Start a session for safe inventory decrement
-  const session = await mongoose.startSession();
-  let transactionStarted = false;
-
   try {
     const { eventId, quantity } = req.body;
 
     // --- Validation ---
-    if (!eventId || !quantity) {
+    if (!eventId || quantity === undefined) {
       return res.status(400).json({ success: false, message: 'eventId and quantity are required.' });
     }
     if (!mongoose.Types.ObjectId.isValid(eventId)) {
@@ -52,43 +48,29 @@ router.post('/', async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Quantity must be a positive integer.' });
     }
 
-    // Try transaction; fall back to non-transactional if unsupported (standalone MongoDB)
-    try {
-      session.startTransaction();
-      transactionStarted = true;
-    } catch {
-      transactionStarted = false;
-    }
-
-    const sessionOpts = transactionStarted ? { session } : {};
-
-    // --- Confirm event exists and has enough tickets ---
-    const event = await Event.findById(eventId).session(session);
+    // --- Confirm event exists ---
+    const event = await Event.findById(eventId);
     if (!event) {
-      if (transactionStarted) await session.abortTransaction();
-      session.endSession();
       return res.status(404).json({ success: false, message: 'Event not found.' });
     }
 
+    // --- Check inventory ---
     if (event.ticketsAvailable < qty) {
-      if (transactionStarted) await session.abortTransaction();
-      session.endSession();
       return res.status(400).json({
         success: false,
         message: `Insufficient tickets. Only ${event.ticketsAvailable} ticket(s) remaining.`,
       });
     }
 
-    // --- Atomic inventory decrement ---
+    // --- Atomic inventory decrement (safe on standalone MongoDB) ---
+    // Uses $gte guard to prevent race-condition overselling
     const updatedEvent = await Event.findOneAndUpdate(
       { _id: eventId, ticketsAvailable: { $gte: qty } },
       { $inc: { ticketsAvailable: -qty } },
-      { new: true, ...sessionOpts }
+      { new: true }
     );
 
     if (!updatedEvent) {
-      if (transactionStarted) await session.abortTransaction();
-      session.endSession();
       return res.status(400).json({
         success: false,
         message: 'Could not reserve tickets. They may have just sold out.',
@@ -96,20 +78,12 @@ router.post('/', async (req, res, next) => {
     }
 
     // --- Create ticket record ---
-    const [ticket] = await Ticket.create(
-      [
-        {
-          attendeeId: req.user.id,
-          eventId,
-          quantity: qty,
-          status: 'booked',
-        },
-      ],
-      sessionOpts
-    );
-
-    if (transactionStarted) await session.commitTransaction();
-    session.endSession();
+    const ticket = await Ticket.create({
+      attendeeId: req.user.id,
+      eventId,
+      quantity: qty,
+      status: 'booked',
+    });
 
     // Populate for response
     await ticket.populate([
@@ -119,12 +93,6 @@ router.post('/', async (req, res, next) => {
 
     res.status(201).json({ success: true, message: 'Ticket booked successfully.', data: ticket });
   } catch (err) {
-    if (transactionStarted) {
-      try {
-        await session.abortTransaction();
-      } catch (_) {}
-    }
-    session.endSession();
     next(err);
   }
 });
@@ -160,15 +128,12 @@ router.get('/:id', async (req, res, next) => {
 /**
  * PATCH /api/v1/tickets/:id/status
  * Updates ticket status.
- * - Attendees can cancel their own booked tickets.
+ * - Attendees can only cancel their own booked tickets.
  * - Organizers/admins can set any valid status.
- * - Cancelled tickets restore inventory; already-cancelled tickets are idempotent.
- * - Used tickets cannot be re-used or re-booked.
+ * - Cancelled tickets restore inventory safely.
+ * - Used tickets cannot be changed.
  */
 router.patch('/:id/status', async (req, res, next) => {
-  const dbSession = await mongoose.startSession();
-  let txStarted = false;
-
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: 'Invalid ticket ID.' });
@@ -183,17 +148,8 @@ router.patch('/:id/status', async (req, res, next) => {
       });
     }
 
-    try {
-      dbSession.startTransaction();
-      txStarted = true;
-    } catch {
-      txStarted = false;
-    }
-
-    const ticket = await Ticket.findById(req.params.id).session(dbSession);
+    const ticket = await Ticket.findById(req.params.id);
     if (!ticket) {
-      if (txStarted) await dbSession.abortTransaction();
-      dbSession.endSession();
       return res.status(404).json({ success: false, message: 'Ticket not found.' });
     }
 
@@ -202,56 +158,35 @@ router.patch('/:id/status', async (req, res, next) => {
     const isPrivileged = ['organizer', 'admin'].includes(req.user.role);
 
     if (!isOwner && !isPrivileged) {
-      if (txStarted) await dbSession.abortTransaction();
-      dbSession.endSession();
       return res.status(403).json({ success: false, message: 'Access denied. Not your ticket.' });
     }
 
     // Attendees can only cancel; privileged users can set any valid status
     if (!isPrivileged && status !== 'cancelled') {
-      if (txStarted) await dbSession.abortTransaction();
-      dbSession.endSession();
       return res.status(403).json({ success: false, message: 'Attendees may only cancel tickets.' });
     }
 
-    // Prevent no-op or invalid transitions for idempotency
+    // Idempotency — already in that status
     if (ticket.status === status) {
-      if (txStarted) await dbSession.abortTransaction();
-      dbSession.endSession();
       return res.status(200).json({ success: true, message: 'Status unchanged.', data: ticket });
     }
 
-    // Cannot revert a used ticket
+    // Cannot change a used ticket
     if (ticket.status === 'used') {
-      if (txStarted) await dbSession.abortTransaction();
-      dbSession.endSession();
       return res.status(400).json({ success: false, message: 'Cannot change status of a used ticket.' });
     }
 
     const previousStatus = ticket.status;
     ticket.status = status;
-    await ticket.save({ session: dbSession });
+    await ticket.save();
 
-    // Restore inventory only when cancelling a BOOKED ticket
+    // Restore inventory only when cancelling a BOOKED ticket (not already-cancelled)
     if (previousStatus === 'booked' && status === 'cancelled') {
-      await Event.findByIdAndUpdate(
-        ticket.eventId,
-        { $inc: { ticketsAvailable: ticket.quantity } },
-        { session: dbSession }
-      );
+      await Event.findByIdAndUpdate(ticket.eventId, { $inc: { ticketsAvailable: ticket.quantity } });
     }
-
-    if (txStarted) await dbSession.commitTransaction();
-    dbSession.endSession();
 
     res.status(200).json({ success: true, message: `Ticket status updated to ${status}.`, data: ticket });
   } catch (err) {
-    if (txStarted) {
-      try {
-        await dbSession.abortTransaction();
-      } catch (_) {}
-    }
-    dbSession.endSession();
     next(err);
   }
 });
