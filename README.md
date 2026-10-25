@@ -94,8 +94,8 @@ itue301-exam--24it065---c1-/
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/24it065/itue301-exam--24it065---c1-.git
-cd itue301-exam--24it065---c1-
+git clone https://github.com/Dhruv5594/EventHub_Ticket_Booking_System.git
+cd EventHub_Ticket_Booking_System
 ```
 
 ### 2. Backend setup
@@ -307,7 +307,7 @@ git commit -m "feat: complete EventHub Ticket Booking System – ITUE301 Set F 2
 git push origin main
 ```
 
-Repository: https://github.com/24it065/itue301-exam--24it065---c1-.git
+Repository: https://github.com/Dhruv5594/EventHub_Ticket_Booking_System
 
 ---
 
